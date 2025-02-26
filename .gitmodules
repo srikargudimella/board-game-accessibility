@@ -1,0 +1,3 @@
+[submodule "Game-Board-Mapping/carddetection"]
+	path = Game-Board-Mapping/carddetection
+	url = https://github.com/lseonu/card-detection.git
