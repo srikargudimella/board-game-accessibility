@@ -1,3 +1,6 @@
 [submodule "Game-Board-Mapping/carddetection"]
 	path = Game-Board-Mapping/carddetection
 	url = https://github.com/lseonu/card-detection.git
+[submodule "Game-Board-Mapping/dicereader"]
+	path = Game-Board-Mapping/dicereader
+	url = https://github.com/jovitakt/CIS4010.git
