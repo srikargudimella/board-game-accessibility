@@ -1,0 +1,5 @@
+opencv-python==4.6.0.66
+numpy==1.26.4
+ultralytics==8.3.64
+shapely==2.0.6
+websockets==11.0.3 
