@@ -16,8 +16,21 @@ import base64
 import io
 
 class GameSession:
+    """
+    Manages a game session including webcam input, piece tracking, and turn management.
+    Handles communication with the frontend client through websockets.
+    """
 
     def __init__(self, reference_map_path, annotations_path, config_file=None, enable_streaming=False):
+        """
+        Initialize a new game session.
+
+        Args:
+            reference_map_path (str): Path to the reference game board image
+            annotations_path (str): Path to XML file containing board annotations
+            config_file (str, optional): Path to JSON config file for game setup
+            enable_streaming (bool): Whether to enable websocket streaming to frontend
+        """
         # Initialize webcam
         self.overhead_cam = cv2.VideoCapture(1)
         # self.overhead_cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -54,7 +67,16 @@ class GameSession:
             self.client_socket = None
 
     def _load_config(self, config_file):
-        """Load game configuration from JSON file"""
+        """
+        Load game configuration from a JSON file.
+        
+        Args:
+            config_file (str): Path to JSON config file containing piece and player settings
+        
+        Raises:
+            FileNotFoundError: If config file doesn't exist
+            ValueError: If config format is invalid
+        """
         try:
             with open(config_file, 'r') as f:
                 config = json.load(f)
@@ -89,6 +111,10 @@ class GameSession:
             raise ValueError(f"Invalid JSON format in config file: {config_file}")
 
     def _show_setup_popup(self):
+        """
+        Display initial game setup window for selecting number of players.
+        Creates a Tkinter window for user input.
+        """
         try:
             selection_window = tk.Toplevel()
         except:
@@ -125,6 +151,12 @@ class GameSession:
         selection_window.wait_window(selection_window)
 
     def _show_player_piece_selection(self, num_players):
+        """
+        Display window for selecting game pieces for each player.
+        
+        Args:
+            num_players (int): Number of players in the game
+        """
         piece_window = tk.Toplevel()
         piece_window.title("Select Player Pieces")
         piece_window.geometry("400x400")
@@ -179,6 +211,13 @@ class GameSession:
         piece_window.wait_window(piece_window)
 
     def _show_control_selection(self, num_players):
+        """
+        Display window for selecting which players are assisted controlled.
+        Maximum of 2 players can be assisted controlled.
+        
+        Args:
+            num_players (int): Number of players in the game
+        """
         control_window = tk.Toplevel()
         control_window.title("Player Control Selection")
         control_window.geometry("400x400")
@@ -216,12 +255,33 @@ class GameSession:
         control_window.wait_window(control_window)
 
     def generate_move_instructions(self, piece_name, target_square):
+        """
+        Generate path instructions for moving a piece to target square.
+        
+        Args:
+            piece_name (str): Name of the piece to move
+            target_square (int): ID of the target square
+            
+        Returns:
+            list: List of path points for piece movement
+        """
         # TO DO: Add code to generate move instructions
         path_points = self.game_board.generate_path(piece_name, target_square)
         self.game_board.show_path(path_points)
         return path_points
 
     def _generate_front_end_path(self, piece_name, target_square):
+        """
+        Generate path information formatted for frontend visualization.
+        
+        Args:
+            piece_name (str): Name of the piece to move
+            target_square (int): ID of the target square
+            
+        Returns:
+            tuple: (path_points, landing_square) where path_points is list of coordinates
+                  and landing_square is final square ID after any special moves
+        """
         front_end_path = []
         for square in self.game_board.reference_map.reference_squares[self.game_board.pieces[piece_name].current_square : target_square+1]:
             front_end_path.append([int(square.center[0]), int(square.center[1])])   
@@ -233,6 +293,16 @@ class GameSession:
         return front_end_path, landing_square
 
     def complete_turn(self, piece_name):
+        """
+        Execute a complete turn for the given piece including:
+        - Drawing a card
+        - Finding target square
+        - Moving piece
+        - Updating game state
+        
+        Args:
+            piece_name (str): Name of the piece taking the turn
+        """
         self.update_game_state()
         self._stream_game_state()
         self.game_board.show_game_board_with_annotations()
@@ -265,6 +335,13 @@ class GameSession:
     
     
     def update_game_state(self):
+        """
+        Update internal game state by processing latest webcam frame.
+        Detects board corners and piece positions.
+        
+        Raises:
+            ValueError: If board corners cannot be detected
+        """
         self._stream_message("game_state_update_start", "Updating game state...")
         stream_sent = False
         while True:
@@ -319,6 +396,10 @@ class GameSession:
         # cv2.destroyAllWindows()
                 
     def _stream_game_state(self):
+        """
+        Send current game state to frontend clients via websocket.
+        Includes turn number, current piece, and all piece positions.
+        """
         game_state = {
             "turn_number": self.turn_number,
             "current_piece": self.pieces[self.turn_number % len(self.pieces)],
@@ -328,7 +409,12 @@ class GameSession:
         self._stream_message("game_state", game_state)
 
     def _stream_frame(self, frame):
-        """Send an OpenCV frame over websocket connection"""
+        """
+        Send a video frame to frontend clients via websocket.
+        
+        Args:
+            frame: OpenCV image frame to stream
+        """
         if not self.websocket_clients:
             return
         
@@ -348,6 +434,13 @@ class GameSession:
             print(f"Error streaming frame: {e}")
 
     def _stream_message(self, message_type, data):
+        """
+        Send a typed message to all websocket clients.
+        
+        Args:
+            message_type (str): Type identifier for the message
+            data: Message payload
+        """
         message_json = {
             "type": message_type,
             "data": data
@@ -355,6 +448,10 @@ class GameSession:
         websockets.broadcast(self.websocket_clients, json.dumps(message_json))
 
     def _start_websocket_server(self):
+        """
+        Start websocket server for frontend communication.
+        Runs in separate thread.
+        """
         async def handler(websocket):
             self.websocket_clients.add(websocket)
             self._stream_game_state()
@@ -370,6 +467,12 @@ class GameSession:
         asyncio.run(start_server())
 
     def draw_card(self):
+        """
+        Process card draw using card reader camera.
+        
+        Returns:
+            str: Card identifier (e.g. "1_Red", "2_Blue", etc)
+        """
         # TO DO: Add code to communicate with microcontroller to draw a card
         # TO DO: Add code to read card using card reader camera
         # ret, frame = self.card_reader_cam.read()
@@ -390,6 +493,10 @@ class GameSession:
         return "1_" + card_color
 
     def main_loop(self):
+        """
+        Main game loop that processes turns until game ends.
+        Waits for 'r' key press to start each turn.
+        """
         while True:
             print(f"Press r to complete turn for {self.pieces[self.turn_number % len(self.pieces)]}...")
             while True:

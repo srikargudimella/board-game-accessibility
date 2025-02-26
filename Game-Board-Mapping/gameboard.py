@@ -8,6 +8,16 @@ import time
 
 @dataclass
 class GamePiece:
+    """
+    Represents a game piece with its current position and control status.
+    
+    Attributes:
+        name (str): Identifier for the piece
+        box (list[int]): Bounding box coordinates [x1,y1,x2,y2]
+        center (list[int]): Center coordinates [x,y]
+        current_square (int): ID of current board square
+        auto_controlled (bool): Whether piece is computer controlled
+    """
     name: str
     box: list[int]
     center: list[int]
@@ -15,15 +25,20 @@ class GamePiece:
     auto_controlled: bool
 
 class GameBoard:
+    """
+    Manages the game board state including piece positions and movement.
+    Handles computer vision processing of the physical board.
+    """
 
     def __init__(self, reference_image_path, annotations_path, pieces=[], human_controlled_pieces=[]):
         """
-        Initialize with reference image and XML annotations
+        Initialize game board with reference image and piece configurations.
         
         Args:
-            reference_image_path: Path to the reference Candyland board image
-            annotations_path: Path to the XML file containing square coordinates
-            pieces: list of piece names that are auto controlled
+            reference_image_path (str): Path to reference board image
+            annotations_path (str): Path to XML annotations
+            pieces (list): List of piece names in play
+            human_controlled_pieces (list): List of pieces controlled by human players
         """
 
         self.reference_map = ReferenceMap(reference_image_path, annotations_path)
@@ -38,6 +53,18 @@ class GameBoard:
             self.pieces[piece].auto_controlled = True
 
     def _detect_corners(self, camera_image):
+        """
+        Detect board corners in camera image using YOLO model.
+        
+        Args:
+            camera_image: OpenCV image from camera
+            
+        Returns:
+            np.array: Ordered corner coordinates (clockwise from top-left)
+            
+        Raises:
+            ValueError: If exactly 4 corners not detected
+        """
         results = self.corner_detector.predict(camera_image, show=False, verbose=False)
         corners = results[0].boxes.xyxy.numpy()
         self.corner_boxes = corners
