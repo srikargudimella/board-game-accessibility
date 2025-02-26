@@ -15,6 +15,8 @@ import websockets
 import base64
 import io
 
+show_cv = False
+
 class GameSession:
     """
     Manages a game session including webcam input, piece tracking, and turn management.
@@ -267,7 +269,8 @@ class GameSession:
         """
         # TO DO: Add code to generate move instructions
         path_points = self.game_board.generate_path(piece_name, target_square)
-        self.game_board.show_path(path_points)
+        if show_cv:
+            self.game_board.show_path(path_points)
         return path_points
 
     def _generate_front_end_path(self, piece_name, target_square):
@@ -305,7 +308,8 @@ class GameSession:
         """
         self.update_game_state()
         self._stream_game_state()
-        self.game_board.show_game_board_with_annotations()
+        if show_cv:
+            self.game_board.show_game_board_with_annotations()
         time.sleep(0.4)
         card_name = self.draw_card()
         target_square = self.game_board.find_target_square(piece_name, card_name)
@@ -329,7 +333,8 @@ class GameSession:
         self.turn_number += 1
         self._stream_message("turn_complete", "Turn complete")
         self.update_game_state()
-        self.game_board.show_game_board_with_annotations()
+        if show_cv:
+            self.game_board.show_game_board_with_annotations()
 
         self._stream_game_state()
     
@@ -485,9 +490,10 @@ class GameSession:
         cv2.namedWindow('Captured Frame', cv2.WINDOW_NORMAL)  # Create resizable window
         cv2.resizeWindow('Captured Frame', 880, 560)  # Set window size to 640x360
         resized_frame = cv2.resize(frame, (880, 560))  # Resize the frame to 640x360
-        cv2.imshow('Captured Frame', resized_frame)
-        cv2.waitKey(2000)  # Display the frame for 2 seconds
-        cv2.destroyAllWindows()
+        if show_cv: 
+            cv2.imshow('Captured Frame', resized_frame)
+            cv2.waitKey(2000)  # Display the frame for 2 seconds
+            cv2.destroyAllWindows()
 
         card_color = process_card(frame)
         return "1_" + card_color

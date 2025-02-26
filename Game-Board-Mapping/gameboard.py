@@ -6,6 +6,7 @@ from referencemap import ReferenceMap, GameSquare, get_center
 from dataclasses import dataclass
 import time
 
+
 @dataclass
 class GamePiece:
     """
@@ -430,6 +431,7 @@ class GameBoard:
         cv2.resizeWindow('Annotated Gameboard', 880, 560)  # Set window size to 640x360
         resized_frame = cv2.resize(annotated_frame, (880, 560))  # Resize the frame to 640x360
 
+            
         cv2.imshow('Annotated Gameboard', resized_frame)
         cv2.waitKey(2000)
         time.sleep(0.2)
