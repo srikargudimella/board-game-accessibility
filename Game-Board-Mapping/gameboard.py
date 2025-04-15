@@ -44,7 +44,20 @@ class GameBoard:
 
         self.reference_map = ReferenceMap(reference_image_path, annotations_path)
         
-        # Store reference corner coordinates (clockwise from top-left)
+        # Load reference image for SIFT feature matching
+        self.reference_image = cv2.imread(reference_image_path)
+        
+        # Initialize SIFT detector
+        self.sift = cv2.SIFT_create()
+        
+        # Compute SIFT features for reference image once
+        self.reference_keypoints, self.reference_descriptors = self.sift.detectAndCompute(
+            cv2.cvtColor(self.reference_image, cv2.COLOR_BGR2GRAY), None)
+        
+        # Initialize feature matcher
+        self.matcher = cv2.BFMatcher()
+        
+        # Keep corner and piece detectors for backup or specific detection tasks
         self.corner_detector = YOLO('corner_detector.pt')
         self.piece_detector = YOLO('game_piece_detector.pt')
         self.pieces = {}
@@ -52,6 +65,12 @@ class GameBoard:
             self.pieces[piece] = GamePiece(name=piece, box=[], center=[], current_square=0, auto_controlled=False)
         for piece in human_controlled_pieces:
             self.pieces[piece].auto_controlled = True
+        
+        # Store previous homography matrix and game square positions for change detection
+        self.previous_homography = None
+        self.previous_game_squares = None
+        self.board_movement_threshold = 20  # Threshold in pixels for significant board movement
+        self.board_moved = False
 
     def _detect_corners(self, camera_image):
         """
@@ -96,18 +115,64 @@ class GameBoard:
         # print("ordered corners", ordered_corners)
         return ordered_corners    
 
-    def _get_game_square_coordinates(self, camera_corners, camera_image):
+    def _compute_homography_with_sift(self, camera_image):
         """
-        Get the coordinates of all game squares in the camera image
+        Compute homography between reference image and camera image using SIFT features.
+        
+        Args:
+            camera_image: OpenCV image from camera
+            
+        Returns:
+            np.array: Homography matrix
+            
+        Raises:
+            ValueError: If not enough matches found for reliable homography
+        """
+        # Convert camera image to grayscale
+        camera_gray = cv2.cvtColor(camera_image, cv2.COLOR_BGR2GRAY)
+        
+        # Detect SIFT features in camera image
+        camera_keypoints, camera_descriptors = self.sift.detectAndCompute(camera_gray, None)
+        
+        # Match features between reference and camera images
+        matches = self.matcher.knnMatch(self.reference_descriptors, camera_descriptors, k=2)
+        
+        # Apply ratio test to filter good matches
+        good_matches = []
+        for m, n in matches:
+            if m.distance < 0.75 * n.distance:
+                good_matches.append(m)
+        
+        # Need at least 4 good matches to compute homography
+        if len(good_matches) < 10:
+            raise ValueError(f"Not enough good matches found: {len(good_matches)}/10 required")
+        
+        # Extract matched keypoints
+        reference_points = np.float32([self.reference_keypoints[m.queryIdx].pt for m in good_matches])
+        camera_points = np.float32([camera_keypoints[m.trainIdx].pt for m in good_matches])
+        
+        # Compute homography matrix
+        H, mask = cv2.findHomography(reference_points, camera_points, cv2.RANSAC, 5.0)
+        
+        # Optional: Draw matches for debugging
+        # matched_img = cv2.drawMatches(self.reference_image, self.reference_keypoints, 
+        #                              camera_image, camera_keypoints, good_matches, None)
+        # cv2.imshow("SIFT Matches", matched_img)
+        # cv2.waitKey(1)
+        
+        return H
+
+    def _get_game_square_coordinates(self, camera_image):
+        """
+        Get the coordinates of all game squares in the camera image using SIFT-based homography
         
         Args:
             camera_image: Current frame from the overhead camera
         Returns:
-            transformed_coordinates: Dictionary mapping square IDs to their box coordinates
+            transformed_coordinates: List of GameSquare objects with transformed coordinates
         """
-        # Hardcoded camera image corners (clockwise from top-left)
-        # Calculate homography
-        H, _ = cv2.findHomography(self.reference_map.reference_corners, camera_corners)
+        # Calculate homography using SIFT
+        H = self._compute_homography_with_sift(camera_image)
         
         # Transform all reference coordinates to camera coordinates
         camera_squares = []
@@ -115,7 +180,7 @@ class GameBoard:
             polygon = square.points
             
             # Convert polygon points to homogeneous coordinates
-            square_points =  np.float32([[x, y, 1] for x, y in polygon])
+            square_points = np.float32([[x, y, 1] for x, y in polygon])
             
             # Transform each point using homography
             transformed_points = []
@@ -125,22 +190,19 @@ class GameBoard:
                 transformed_points.append(transformed_point[:2])
             transformed_center = get_center(transformed_points)
             camera_square = GameSquare(
-                id= square.id,
-                name= square.name,
-                points= transformed_points,
-                center= transformed_center,
-                color= square.color,
+                id=square.id,
+                name=square.name,
+                points=transformed_points,
+                center=transformed_center,
+                color=square.color,
                 contains_dragon=square.contains_dragon,
-                landing_square= square.landing_square
+                landing_square=square.landing_square
             )
 
             camera_squares.append(camera_square)
             
-
         return camera_squares
-    
 
-    
     def _piece_in_square(self, piece_box, square):
         
         return True
@@ -163,7 +225,7 @@ class GameBoard:
 
 
     def _detect_pieces(self, camera_image):
-        results = self.piece_detector.predict(camera_image, verbose=False)
+        results = self.piece_detector.predict(camera_image, verbose=False, imgsz=640)
         piece_classes = results[0].boxes.cls.numpy()
         names = results[0].names
         piece_names = [names[int(cls)] for cls in piece_classes]
@@ -176,16 +238,34 @@ class GameBoard:
 
     
     def update_game_board(self, camera_image):
-        # cv2.imshow('camera_image', camera_image)
-        # cv2.waitKey(0)  # Display frame for 1ms instead of waiting for keypress
-        # cv2.destroyAllWindows()
-
         self.latest_game_frame = camera_image
-        self.corners = self._detect_corners(camera_image)
-        if len(self.corners) != 4:
-            raise ValueError("Error: Detected corners do not match expected number of corners")
-        self.game_squares = self._get_game_square_coordinates( self.corners, camera_image)
-        self._detect_pieces(camera_image)
+        
+        try:
+            # Use SIFT-based approach to get game square coordinates
+            H = self._compute_homography_with_sift(camera_image)
+            self.game_squares = self._get_game_square_coordinates_with_homography(H, camera_image)
+            
+            # Detect if board has moved significantly
+            self.board_moved, displacement = self._detect_board_movement(H, self.game_squares)
+            
+            # Detect pieces using YOLO model
+            self._detect_pieces(camera_image)
+            
+            
+        except ValueError as e:
+            # Fallback to corner detection if SIFT fails
+            print(f"SIFT homography failed: {e}. Falling back to corner detection.")
+            self.corners = self._detect_corners(camera_image)
+            if len(self.corners) != 4:
+                raise ValueError("Error: Detected corners do not match expected number of corners")
+            
+            H, _ = cv2.findHomography(self.reference_map.reference_corners, self.corners)
+            self.game_squares = self._get_game_square_coordinates_with_homography(H, camera_image)
+            
+            # Still check for board movement with corner-based homography
+            self.board_moved, displacement = self._detect_board_movement(H, self.game_squares)
+            
+            self._detect_pieces(camera_image)
 
     def _find_next_color_square(self, curr_square_id, color, index):
         # print(f"Finding next {color} square at index {index} starting from square {curr_square_id}")
@@ -218,7 +298,7 @@ class GameBoard:
         
         # Add starting position
         path_points.append(self.pieces[piece_name].center)
-        
+
         # Generate intermediate waypoints through squares between current and target
         current_id = current_square
         while current_id < target_square_id:
@@ -473,22 +553,22 @@ class GameBoard:
             else:
                 text = str(square.id)
             # Draw the polygon outline in white
-            cv2.polylines(img_copy, [np.int32(points)], isClosed=True, color=(0, 0, 0), thickness=4)  # White outline
+            # cv2.polylines(img_copy, [np.int32(points)], isClosed=True, color=(0, 0, 0), thickness=2)  # White outline
             
             # Draw the polygon interior in the specified color
-            cv2.polylines(img_copy, [np.int32(points)], isClosed=True, color=color, thickness=2)  # Colored interior            
+            cv2.polylines(img_copy, [np.int32(points)], isClosed=True, color=color, thickness=1)  # Colored interior            
             # Draw the annotated coordinates on the image
             cv2.circle(img_copy, (int(square.center[0]), int(square.center[1])), 5, green, -1)  # Green dot for coordinates
             
             # Draw a black rectangle behind the text for highlighting
             text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
-            text_x = int(square.center[0]) - text_size[0] // 2
-            text_y = int(square.center[1]) - 10 - text_size[1] // 2
-            cv2.rectangle(img_copy, (text_x - 5, text_y - text_size[1] - 5), 
-                           (text_x + text_size[0] + 5, text_y + 5), (0, 0, 0), -1)  # Black rectangle
+            # text_x = int(square.center[0]) - text_size[0] // 2
+            # text_y = int(square.center[1]) - 10 - text_size[1] // 2
+            # cv2.rectangle(img_copy, (text_x - 5, text_y - text_size[1] - 5), 
+            #                (text_x + text_size[0] + 5, text_y + 5), (0, 0, 0), -1)  # Black rectangle
             
-            cv2.putText(img_copy, text, (text_x, text_y), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)            
+            # cv2.putText(img_copy, text, (text_x, text_y), 
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)            
         
         for piece, game_piece in self.pieces.items():      
             box = game_piece.box
@@ -502,8 +582,9 @@ class GameBoard:
                            (text_x + text_size[0] + 5, text_y + 5), (0, 0, 0), -1)  # Black rectangle
 
             cv2.putText(img_copy, str(piece), (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)  # Updated to use text_x for alignment
+        cv2.imwrite('result.png', img_copy)  # Save the annotated image as a PNG file
         return img_copy
-
+    
     def plot_path(self, path_points, frame=None):
         """
         Plot the generated path on the game board image.
@@ -523,7 +604,9 @@ class GameBoard:
         # First draw the regular annotations
         frame = self.annotate_frame(frame)
         
+    
         # Convert path points to integer coordinates for drawing
+        print(path_points)
         path_points = np.array(path_points, dtype=np.int32)
         
         # Draw lines connecting path points
@@ -561,5 +644,122 @@ class GameBoard:
         cv2.waitKey(2000)
         cv2.destroyAllWindows()
         cv2.waitKey(1)
+
+    def _get_game_square_coordinates_with_homography(self, H, camera_image):
+        """
+        Get the coordinates of all game squares using provided homography matrix
+        
+        Args:
+            H: Homography matrix
+            camera_image: Current frame from the overhead camera
+        Returns:
+            transformed_coordinates: List of GameSquare objects with transformed coordinates
+        """
+        # Transform all reference coordinates to camera coordinates
+        camera_squares = []
+        for square in self.reference_map.reference_squares:
+            polygon = square.points
+            
+            # Convert polygon points to homogeneous coordinates
+            square_points = np.float32([[x, y, 1] for x, y in polygon])
+            
+            # Transform each point using homography
+            transformed_points = []
+            for point in square_points:
+                transformed_point = np.dot(H, point)
+                transformed_point = transformed_point / transformed_point[2]
+                transformed_points.append(transformed_point[:2])
+            transformed_center = get_center(transformed_points)
+            camera_square = GameSquare(
+                id=square.id,
+                name=square.name,
+                points=transformed_points,
+                center=transformed_center,
+                color=square.color,
+                contains_dragon=square.contains_dragon,
+                landing_square=square.landing_square
+            )
+
+            camera_squares.append(camera_square)
+            
+        return camera_squares
+
+    def _detect_board_movement(self, current_homography, current_squares):
+        """
+        Detect if the game board has moved significantly since the last update.
+        
+        Args:
+            current_homography: Current homography matrix
+            current_squares: Current game squares
+            
+        Returns:
+            bool: True if significant movement detected, False otherwise
+            float: Maximum displacement in pixels
+        """
+        if self.previous_homography is None or self.previous_game_squares is None:
+            # First run, no previous data to compare
+            self.previous_homography = current_homography.copy()
+            self.previous_game_squares = current_squares.copy()
+            return True, 0
+        
+        # Method 1: Compare homography matrices directly
+        # Calculate the difference between homography matrices
+        h_diff = np.linalg.norm(current_homography - self.previous_homography)
+        
+        # Method 2: Compare the actual positions of key points
+        # This is more intuitive as it measures actual pixel displacement
+        max_displacement = 0
+        
+        # Use the four corners of the board as reference points
+        test_points = [
+            [0, 0],  # Top-left
+            [self.reference_image.shape[1], 0],  # Top-right
+            [0, self.reference_image.shape[0]],  # Bottom-left
+            [self.reference_image.shape[1], self.reference_image.shape[0]]  # Bottom-right
+        ]
+        
+        for point in test_points:
+            # Transform point using previous homography
+            prev_point = np.dot(self.previous_homography, np.array([point[0], point[1], 1]))
+            prev_point = prev_point[:2] / prev_point[2]
+            
+            # Transform point using current homography
+            curr_point = np.dot(current_homography, np.array([point[0], point[1], 1]))
+            curr_point = curr_point[:2] / curr_point[2]
+            
+            # Calculate displacement
+            displacement = np.linalg.norm(curr_point - prev_point)
+            max_displacement = max(max_displacement, displacement)
+        
+        # Method 3: Compare centers of game squares
+        square_displacements = []
+        for i, square in enumerate(current_squares):
+            if i < len(self.previous_game_squares):
+                prev_center = np.array(self.previous_game_squares[i].center)
+                curr_center = np.array(square.center)
+                displacement = np.linalg.norm(curr_center - prev_center)
+                square_displacements.append(displacement)
+        
+        if square_displacements:
+            avg_square_displacement = sum(square_displacements) / len(square_displacements)
+            max_square_displacement = max(square_displacements)
+        else:
+            avg_square_displacement = 0
+            max_square_displacement = 0
+        
+        # Update previous values
+        self.previous_homography = current_homography.copy()
+        self.previous_game_squares = current_squares.copy()
+        
+        # Determine if movement is significant
+        # We can use a combination of metrics or just one
+        significant_movement = (max_displacement > self.board_movement_threshold or 
+                               max_square_displacement > self.board_movement_threshold)
+        
+        if significant_movement:
+            print(f"Board movement detected! Max displacement: {max_displacement:.2f}px, "
+                  f"Max square displacement: {max_square_displacement:.2f}px")
+        
+        return significant_movement, max(max_displacement, max_square_displacement)
 
         

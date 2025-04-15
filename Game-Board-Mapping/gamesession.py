@@ -14,9 +14,15 @@ import asyncio
 import websockets
 import base64
 import io
+import numpy as np
+# import pygame  # Commented out pygame import
+import serial  # Uncommented serial import
+import keyboard  # Import the keyboard library
 
-show_cv = False
+show_cv = True
 
+X_MAX = 340
+Y_MAX = 315
 class GameSession:
     """
     Manages a game session including webcam input, piece tracking, and turn management.
@@ -44,10 +50,57 @@ class GameSession:
         if not self.card_reader_cam.isOpened():
             raise Exception("Error: Could not open card reader webcam")
         
+        # Initialize serial connection to CNC controller
+        try:
+            self.serial_conn = serial.Serial(
+                port='/dev/cu.usbmodem2101',  # or 'COM3' on Windows
+                baudrate=115200,
+                timeout=1,
+                writeTimeout=1
+            )
+            # Wait for Grbl to initialize
+            time.sleep(2)
+            self.serial_conn.flushInput()
+            print("Serial connection to CNC controller established")
+            
+            # Home the controller
+            # Read initial position report before homing
+            # self._send_g_code_command(b'?\n')  # Request position report
+            # time.sleep(0.5)  # Wait for response
+            
+            # print("Position before homing:")
+            # while self.serial_conn.in_waiting > 0:
+            #     response = self.serial_conn.readline().decode().strip()
+            #     print(f"  {response}")
+            self._send_g_code_command(b'$H\n')           
+            # self._send_g_code_command(b'$X\n')
+
+            # self._send_g_code_command(b'?\n')  # Request position report
+            # time.sleep(0.5)  # Wait for response
+            
+            # print("Position before homing:")
+            # while self.serial_conn.in_waiting > 0:
+            #     response = self.serial_conn.readline().decode().strip()
+            #     print(f"  {response}")
+
+            
+            # Set units to millimeters and absolute positioning
+            self._send_g_code_command(b'G21\n')  # Set units to millimeters
+            
+            # Set work coordinates
+            move_to_origin_string = f"G91 G0 X-{X_MAX} Y0\n"
+            self._send_g_code_command(move_to_origin_string.encode())  # Move to position
+            self._send_g_code_command(b'G10 L20 P1 X0 Y0 Z0\n')  # Set work coordinates
+                          
+        except serial.SerialException as e:
+            print(f"Warning: Could not open serial port: {e}")
+            self.serial_conn = None
+        
+        self.r_pressed = False
+        self.m_pressed = False
         # Create popup window for piece selection or load from config
         self.pieces = []
         self.assisted_controlled_input = []
-        
         if config_file:
             self._load_config(config_file)
         else:
@@ -67,6 +120,9 @@ class GameSession:
             self.ws_thread.start()
         else:
             self.client_socket = None
+        # pygame.init()  # Commented out pygame initialization
+        # self.screen = pygame.display.set_mode((640, 480))  # Commented out window creation
+        # pygame.display.set_caption('Game Session')  # Commented out window title setting
 
     def _load_config(self, config_file):
         """
@@ -294,6 +350,301 @@ class GameSession:
         else:
             landing_square = target_square
         return front_end_path, landing_square
+    
+    def execute_move(self, move_instructions, frame):
+        """
+        Execute physical movement of a game piece using the CNC XY plotter.
+        Transforms image coordinates to physical coordinates and generates G-code.
+        
+        Args:
+            move_instructions (list): List of path points in image coordinates
+        """
+        if not move_instructions or len(move_instructions) < 2:
+            print("Warning: No valid move instructions provided")
+            return
+        print("move_instructions", move_instructions)
+        # Transform image coordinates to physical coordinates
+        physical_coordinates = self._transform_to_physical_coordinates(move_instructions, frame)
+        
+        # Generate G-code for the movement path
+        gcode_path = self._generate_gcode(physical_coordinates)
+        
+        # Send G-code to the CNC controller
+        self._send_gcode_to_controller(gcode_path)
+        
+    def _transform_to_physical_coordinates(self, image_coordinates, frame):
+        """
+        Transform image coordinates to physical coordinates using calibration pattern.
+        
+        Args:
+            image_coordinates (list): List of [x,y] coordinates in image space
+            frame: Current camera frame
+            
+        Returns:
+            list: List of [x,y] coordinates in physical space (mm)
+        """
+        print("transform_to_physical_coordinates")
+        # Detect calibration pattern in the current frame
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        pattern_size = (3, 38)  # Number of inner corners in the calibration pattern
+        
+        # Try to find the chessboard corners
+        print("finding chessboard corners")
+        ret, corners = cv2.findChessboardCornersSB(gray, pattern_size, None)
+        if not ret:
+            print("Warning: Could not detect calibration pattern")
+            # Fallback to a simple scaling factor if pattern not detected
+            return self._apply_simple_scaling(image_coordinates)
+        print("detected chessboard corners")
+        # Visualize detected corners for debugging
+        if ret and show_cv:
+            img_with_corners = frame.copy()
+            cv2.drawChessboardCorners(img_with_corners, pattern_size, corners, ret)
+            cv2.imshow('Detected Corners', img_with_corners)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+        
+        # Known physical dimensions of the calibration pattern (in mm)
+        square_size = 10  # Size of each square in mm
+        
+        # Create array of physical coordinates for the pattern
+        # The corners are ordered row by row, so we need to match that ordering
+        physical_corners = np.zeros((pattern_size[0] * pattern_size[1], 2), np.float32)
+        for i in range(pattern_size[1]):  # rows
+            for j in range(pattern_size[0]):  # columns
+                # Calculate index in the flattened array
+                idx = i * pattern_size[0] + j
+                # Assign physical coordinates (in mm)
+                physical_corners[idx] = [j * square_size - 90 , i * square_size - 60]
+        # Extract detected corner points correctly
+        detected_points = np.array([corner[0] for corner in corners])
+        if detected_points[0][1] > detected_points[-1][1]:
+            detected_points= detected_points[::-1]
+        for idx, point in enumerate(detected_points):
+            print("Image point:", point, " - physical point:", physical_corners[idx])
+        # Calculate homography matrix
+        H, status = cv2.findHomography(detected_points, physical_corners, cv2.RANSAC, 5.0)
+        
+        if H is None:
+            print("Failed to calculate homography matrix")
+            return self._apply_simple_scaling(image_coordinates)
+            
+        # For debugging, transform a few test points to verify the homography
+        test_points = [
+            [0, 0],  # Origin
+            [frame.shape[1], 0],  # Top right
+            [0, frame.shape[0]],  # Bottom left
+            [frame.shape[1], frame.shape[0]]  # Bottom right
+        ]
+        print("Test image points:", test_points)
+        test_physical = []
+        for point in test_points:
+            homogeneous = np.array([point[0], point[1], 1])
+            transformed = np.dot(H, homogeneous)
+            physical = transformed[:2] / transformed[2]
+            test_physical.append(physical)
+        print("Test physical points:", test_physical) 
+
+        
+        # Transform image coordinates to physical coordinates
+        physical_coords = []
+        for point in image_coordinates:
+            # Convert to homogeneous coordinates
+            homogeneous = np.array([point[0], point[1], 1])
+            # Apply transformation
+            transformed = np.dot(H, homogeneous)
+            # Convert back from homogeneous coordinates
+            physical = transformed[:2] / transformed[2]
+            physical[0] = max(1, min(physical[0], X_MAX))
+            physical[1] = max(1, min(physical[1], Y_MAX))
+            physical_coords.append(physical)
+            
+        print("Image coordinates:", image_coordinates)
+        print("Physical coordinates:", physical_coords)
+        
+        return physical_coords
+    
+    def _apply_simple_scaling(self, image_coordinates):
+        """
+        Apply a simple scaling transformation as fallback when calibration pattern isn't detected.
+        
+        Args:
+            image_coordinates (list): List of [x,y] coordinates in image space
+            
+        Returns:
+            list: List of [x,y] coordinates in physical space (mm)
+        """
+        # Estimated physical dimensions of the game board in mm
+        physical_width = 500  # Adjust based on your actual board size
+        physical_height = 500
+        
+        # Image dimensions
+        image_height, image_width = self.game_board.latest_game_frame.shape[:2]
+        
+        # Calculate scaling factors
+        scale_x = physical_width / image_width
+        scale_y = physical_height / image_height
+        
+        # Apply scaling
+        physical_coords = []
+        for point in image_coordinates:
+            physical_x = point[0] * scale_x
+            physical_y = point[1] * scale_y
+            physical_coords.append([physical_x, physical_y])
+            
+        return physical_coords
+    
+    def _generate_gcode(self, physical_coordinates):
+        """
+        Generate G-code for the CNC plotter to follow the path.
+        
+        Args:
+            physical_coordinates (list): List of [x,y] coordinates in physical space (mm)
+            
+        Returns:
+            str: G-code commands for the movement
+        """
+        gcode = []
+        
+        # Add header - just set units and coordinate mode
+        gcode.append("G21 ; Set units to millimeters")
+        gcode.append("G54 ; Select work coordinate system")
+        
+        # Since the controller is already attached to the piece,
+        # we can start moving directly through the waypoints
+        for i, point in enumerate(physical_coordinates):
+            # First point might need a different speed
+            if i == 0:
+                gcode.append(f"G90 G1 X{point[0]:.2f} Y{point[1]:.2f} F3000 ; Move to waypoint {i}")
+            else:
+                gcode.append(f"G90 G1 X{point[0]:.2f} Y{point[1]:.2f} F2000 ; Move to waypoint {i}")
+        
+        
+        return "\n".join(gcode)
+    
+    def _send_g_code_command(self, cmd):
+        """
+        Send a G-code command to the CNC controller and wait for 'ok' response.
+        
+        Args:
+            cmd (bytes): Command to send to the controller
+            
+        Returns:
+            bool: True if response received, False otherwise
+        """
+        if self.serial_conn is None or not self.serial_conn.is_open:
+            print("Warning: Serial connection not available")
+            return False
+            
+        self.serial_conn.write(cmd)
+        print(f"Sent: {cmd.decode().strip()}")
+        
+        # Wait for response with timeout
+        response_received = False
+        start_time = time.time()
+        timeout = 60  # 60 seconds timeout for response
+        
+        while not response_received and time.time() - start_time < timeout:
+            if self.serial_conn.in_waiting > 0:
+                response = self.serial_conn.readline().decode().strip()
+                
+                if response.startswith('error:'):
+                    print(f"Error from Grbl: {response}")
+                    response_received = True
+                elif response == 'ok':
+                    print("Received: ok")
+                    response_received = True
+                else:
+                    # Log other responses (like position reports)
+                    print(f"Grbl: {response}")
+            else:
+                # Small delay to prevent CPU hogging while waiting for response
+                time.sleep(0.01)
+        
+        if not response_received:
+            print(f"Warning: No response from Grbl for command: {cmd.decode().strip()}")
+        
+        return response_received
+
+    def _send_gcode_to_controller(self, gcode):
+        """
+        Send G-code to the CNC controller line by line using serial communication.
+        Implements the simple send-response protocol for Grbl.
+        Also saves G-code to file for debugging.
+        
+        Args:
+            gcode (str): G-code commands to send
+        """
+        # Save G-code to file for debugging
+        gcode_file = "move_path.gcode"
+        with open(gcode_file, "w") as f:
+            f.write(gcode)
+        
+        print(f"G-code saved to {gcode_file}")
+        
+        # Function to establish/reestablish serial connection
+        def ensure_connection():
+            if self.serial_conn is None or not self.serial_conn.is_open:
+                try:
+                    # If connection exists but is closed, try to reopen
+                    if self.serial_conn is not None:
+                        try:
+                            self.serial_conn.open()
+                            print("Reopened existing serial connection")
+                        except (serial.SerialException, ValueError):
+                            # If reopening fails, create a new connection
+                            self.serial_conn = None
+                
+                    # If no connection exists, create a new one
+                    if self.serial_conn is None:
+                        self.serial_conn = serial.Serial(
+                            port='/dev/ttyUSB0',  # or 'COM3' on Windows
+                            baudrate=115200,
+                            timeout=1,
+                            writeTimeout=1
+                        )
+                        print("Established new serial connection")
+                
+                    # Wait for Grbl to initialize and flush startup text
+                    time.sleep(2)
+                    self.serial_conn.flushInput()
+                    return True
+                except serial.SerialException as e:
+                    print(f"Error establishing serial connection: {e}")
+                    self.serial_conn = None
+                    return False
+            return True  # Connection already exists and is open
+        
+        # Ensure we have a valid connection before proceeding
+        if not ensure_connection():
+            print("Warning: Could not establish serial connection. G-code not sent.")
+            return
+        
+        try:
+            # Split gcode into lines and remove empty lines and comments
+            lines = [line.strip() for line in gcode.splitlines()]
+            lines = [line for line in lines if line and not line.startswith(';')]
+            
+            for line in lines:
+                # Check connection before sending each line
+                if not ensure_connection():
+                    print("Serial connection lost and could not be re-established")
+                    break
+                
+                # Send g-code line using the _send_g_code_command method
+                cmd = (line.strip() + '\n').encode()
+                success = self._send_g_code_command(cmd)
+                
+                if not success:
+                    print(f"Failed to get response for command: {line}")
+                    # Try to reestablish connection for next command
+                    ensure_connection()
+                
+        except Exception as e:
+            print(f"Error during G-code transmission: {e}")
+            import traceback
+            traceback.print_exc()
 
     def complete_turn(self, piece_name):
         """
@@ -321,14 +672,24 @@ class GameSession:
             # self._stream_message("player_move_prompt", "Waiting for player to hit m to move...")
             move_instructions = self.generate_move_instructions(piece_name, target_square)
             while True:
-                key = input()
-                if key == 'm':
+                # print("self.m_pressed", self.m_pressed)
+                # for event in pygame.event.get():  # Commented out pygame event handling
+                #     if event.type == pygame.KEYDOWN:
+                #         print(event.key)
+                #         if event.key == pygame.K_m:
+                #             self.m_pressed = True
+                if keyboard.is_pressed('m'):  # Use keyboard library for 'm' key press
+                    self.m_pressed = True
+                if self.m_pressed:
+                    print("m pressed")
+                    self.m_pressed = False
                     break
         else:
             time.sleep(15)
         # print(self.game_board.pieces[piece_name].current_square)
+        print("landing_square", landing_square)
         self.game_board.update_piece_position(piece_name, landing_square)
-        # self.movement_controller.execute_move(move_instructions)
+        self.execute_move(move_instructions, self.game_board.latest_game_frame)
 
         self.turn_number += 1
         self._stream_message("turn_complete", "Turn complete")
@@ -348,58 +709,57 @@ class GameSession:
             ValueError: If board corners cannot be detected
         """
         self._stream_message("game_state_update_start", "Updating game state...")
-        stream_sent = False
         while True:
             ret, frame = self.overhead_cam.read()
-            
+            # Rotate the frame by 180 degrees
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
             if not ret:
                 raise Exception("Error: Could not read frame from webcam")
+            # frame = cv2.imread("image1.jpg")
             try:
                 self.game_board.update_game_board(frame)
                 time.sleep(0.2)
-                # print("Double check")
-                self.game_board.update_game_board(frame)
                 
-                # Draw annotations
-                annotated_frame = frame.copy()
-                for box in self.game_board.corner_boxes:
-                    cv2.rectangle(annotated_frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 0, 255), 2)
-                for piece, piece_info in self.game_board.pieces.items():
-                    if len(piece_info.box) > 0:
-                        cv2.rectangle(annotated_frame, (int(piece_info.box[0]), int(piece_info.box[1])), 
-                                    (int(piece_info.box[2]), int(piece_info.box[3])), (0, 255, 0), 2)
-                
+                annotated_frame = self.game_board.annotate_frame(frame)
                 # cv2.imshow('frame', annotated_frame)
-                if stream_sent:
-                    for i in range(5):
-                        ret, frame = self.overhead_cam.read()
-                        if not ret:
-                            raise Exception("Error: Could not read frame from webcam")
-                        self.game_board.update_game_board(frame)
-                        time.sleep(0.2)
-                        # print("Double check2")
-                        self.game_board.update_game_board(frame)
-                        annotated_frame = frame.copy()
-                        for box in self.game_board.corner_boxes:
-                            cv2.rectangle(annotated_frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 0, 255), 2)
-                        self._stream_frame(annotated_frame)
-                    # End of if stream_sent block
-                break  # Move break statement here to exit while True loop
                 # cv2.waitKey(0)
+                # cv2.destroyAllWindows()
+                # cv2.waitKey(1)
+                
+                # If board moved or it's the first update, show alignment and wait for confirmation
+                if self.game_board.board_moved or not hasattr(self, 'alignment_confirmed'):
+                    self.alignment_confirmed = False
+                    self._stream_message("game_board_alignment_display", "prepare to show display")
+                    self._stream_frame(annotated_frame)
+                    
+                    # Wait for confirmation from frontend (with timeout)
+                    confirmation_received = False
+                    start_time = time.time()
+                    timeout = 10  # 10 seconds timeout
+                    
+                    while not confirmation_received and time.time() - start_time < timeout:
+                        # Check if confirmation has been received (set by websocket handler)
+                        if hasattr(self, 'alignment_confirmed') and self.alignment_confirmed:
+                            confirmation_received = True
+                        time.sleep(0.1)
+                    
+                    # If timeout occurred without explicit rejection, assume alignment is good
+                    if not confirmation_received:
+                        print("Alignment confirmation timed out, assuming alignment is good")
+                        self.alignment_confirmed = True
+                
+                break
+                
             except ValueError as e:
                 stream_sent = True
                 for box in self.game_board.corner_boxes:
                     cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 0, 255), 2)
                 if self.stream_enabled:
                     self._stream_frame(frame)
-                # cv2.imshow('frame', frame)
-                # print(f"Error updating game board: {e}. Retrying...")
-                # if cv2.waitKey(1) == ord('q'):
-                #     break
+
+        print("Game state update completed")
         self._stream_message("game_state_update_success", "Game state updated successfully")
 
-        # cv2.destroyAllWindows()
-                
     def _stream_game_state(self):
         """
         Send current game state to frontend clients via websocket.
@@ -415,7 +775,7 @@ class GameSession:
 
     def _stream_frame(self, frame):
         """
-        Send a video frame to frontend clients via websocket.
+        Send a video frame to frontend clients via websocket as a single image.
         
         Args:
             frame: OpenCV image frame to stream
@@ -424,19 +784,32 @@ class GameSession:
             return
         
         try:
-            # Encode frame as JPEG with higher quality
+            # Resize the frame to have a maximum dimension of 1200 pixels
+            max_dimension = 1200
+            height, width = frame.shape[:2]
+            if max(height, width) > max_dimension:
+                scale = max_dimension / max(height, width)
+                new_size = (int(width * scale), int(height * scale))
+                frame = cv2.resize(frame, new_size)
+
+            # Encode frame with good quality
             _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            
             # Convert to base64 string
             img_str = base64.b64encode(buffer).decode('utf-8')
             
-            # Send with proper message structure
+            # Send the image as a single message
             self._stream_message("game_board_frame", {
                 "image": img_str,
                 "timestamp": time.time()
             })
             
+            print("Successfully sent the image frame to clients")
+            
         except Exception as e:
             print(f"Error streaming frame: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _stream_message(self, message_type, data):
         """
@@ -461,12 +834,53 @@ class GameSession:
             self.websocket_clients.add(websocket)
             self._stream_game_state()
             try:
+                async for message in websocket:
+                    try:
+                        data = json.loads(message)
+                        command = data.get('command')
+                        print(command)
+                        if command == 'draw_card':
+                            self.r_pressed = True
+                            print(self.r_pressed)
+                            # print("handler_m_pressed:", self.m_pressed)
+                        elif command == 'move':
+                            self.m_pressed = True
+                            # Process move command
+                            # Move handling code...
+                        
+                        elif command == 'request_alignment_view':
+                            # Send current alignment view
+                            frame = cv2.imread("image.png")  # Or get from camera
+                            annotated_frame = self.game_board.annotate_frame(frame)
+                            self._stream_message("game_board_alignment_display", "manual alignment view")
+                            self._stream_frame(annotated_frame)
+                        
+                        elif command == 'confirm_alignment':
+                            # Mark alignment as confirmed
+                            self.alignment_confirmed = True
+                            print("Alignment confirmed by frontend")
+                        
+                        elif command == 'report_alignment_issue':
+                            # Mark alignment as rejected
+                            self.alignment_confirmed = False
+                            print("Alignment issue reported by frontend")
+                            # You could trigger a recalibration here
+                            
+                    except json.JSONDecodeError:
+                        print(f"Invalid JSON received: {message}")
+                    except Exception as e:
+                        print(f"Error processing message: {e}")
+                
                 await websocket.wait_closed()
             finally:
                 self.websocket_clients.remove(websocket)
 
         async def start_server():
-            self.websocket_server = await websockets.serve(handler, "localhost", 8089)
+            self.websocket_server = await websockets.serve(
+                lambda ws: handler(ws), 
+                "localhost", 
+                8089
+            )
             await self.websocket_server.wait_closed()
 
         asyncio.run(start_server())
@@ -495,7 +909,8 @@ class GameSession:
             cv2.waitKey(2000)  # Display the frame for 2 seconds
             cv2.destroyAllWindows()
 
-        card_color = process_card(frame)
+        # card_color = process_card(frame)
+        card_color =  "yellow" if self.turn_number == 0 else "green"
         return "1_" + card_color
 
     def main_loop(self):
@@ -503,13 +918,25 @@ class GameSession:
         Main game loop that processes turns until game ends.
         Waits for 'r' key press to start each turn.
         """
-        while True:
-            print(f"Press r to complete turn for {self.pieces[self.turn_number % len(self.pieces)]}...")
-            while True:
-                key = input()  # Wait for key input
-                if key == 'r':
-                    break  # Exit loop when 'r' is pressed
-            self.complete_turn(self.pieces[self.turn_number % len(self.pieces)])
+        running = True
+        print("Starting main loop")
+        print ("Waiting for r key press")
+        while running:
+            # Check for 'r' key press globally
+            if keyboard.is_pressed('r'):
+                self.r_pressed = True
+                print("R key pressed")
+
+            if self.r_pressed:
+                self.r_pressed = False  # Reset after processing
+                self.complete_turn(self.pieces[self.turn_number % len(self.pieces)])
+                print("Turn complete")
+                print("Waiting for r key press")
+            
+            # Add a small sleep to prevent high CPU usage
+            time.sleep(0.1)
+
+        # pygame.quit()  # Commented out pygame cleanup
     
     def __del__(self):
         # Release the webcam when the object is destroyed
@@ -521,6 +948,8 @@ class GameSession:
             self.client_socket.close()
         if hasattr(self, 'websocket_server') and self.websocket_server:
             self.websocket_server.close()
+        if hasattr(self, 'serial_conn') and self.serial_conn:
+            self.serial_conn.close()
 
 
 
