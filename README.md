@@ -23,6 +23,9 @@ The application can be run from the command line with the following syntax:
 python gamesession.py [-s | Flag to enable streaming of game state to the frontend through websockets] [optional path to config.json file]
 ```
 
+```
+sudo python gamesession.py -s config.json
+```
 If the config file isn't provided, the program will show interactive popup windows to configure the game setup. If the streaming flag is provided, the program will stream game state update messages to the websocket running at localhost:8089. To have it work with the frontend, run the frontend code in a separate process. 
 
 
